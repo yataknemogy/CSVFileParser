@@ -1,59 +1,112 @@
-import java.io.BufferedReader;
-import java.io.FileReader;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class CSVParser {
-    private List<String[]> records;
+    private final List<Record> records = new CopyOnWriteArrayList<>();
+    private static final List<Character> POSSIBLE_DELIMITERS = List.of(',', ';', '\t', ' ');
 
-    public void parse(String filePath) throws IOException {
-        records = new ArrayList<>();
+    public void parse(String filePath) throws IOException, InterruptedException, ExecutionException {
+        char delimiter = determineDelimiter(filePath);
+        String[] headers = getHeaders(filePath, delimiter);
+        
+        try (Stream<String> lines = Files.lines(Path.of(filePath))) {
+            List<Callable<Record>> tasks = lines.skip(1)
+                .map(line -> (Callable<Record>) () -> parseLine(line, headers, delimiter))
+                .toList();
 
-        try (BufferedReader reader = new BufferedReader(new FileReader(filePath))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                String[] values = parseLine(line);
-                records.add(values);
+            int numCores = Runtime.getRuntime().availableProcessors();
+            ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+            
+            List<Future<Record>> futures = executor.invokeAll(tasks);
+            for (Future<Record> future : futures) {
+                records.add(future.get());
             }
+            executor.shutdown();
         }
     }
 
-    public List<String[]> getRecords() {
-        return records;
+    private char determineDelimiter(String filePath) throws IOException {
+        Map<Character, Integer> delimiterCounts = new HashMap<>();
+        for (char delimiter : POSSIBLE_DELIMITERS) {
+            delimiterCounts.put(delimiter, 0);
+        }
+
+        try (Stream<String> lines = Files.lines(Path.of(filePath))) {
+            lines.limit(10).forEach(line -> {
+                for (char delimiter : POSSIBLE_DELIMITERS) {
+                    int count = line.chars().filter(ch -> ch == delimiter).toArray().length;
+                    delimiterCounts.put(delimiter, delimiterCounts.get(delimiter) + count);
+                }
+            });
+        }
+
+        return Collections.max(delimiterCounts.entrySet(), Map.Entry.comparingByValue()).getKey();
+    }
+
+    private String[] getHeaders(String filePath, char delimiter) throws IOException {
+        try (Stream<String> lines = Files.lines(Path.of(filePath))) {
+            return lines.findFirst().map(line -> line.split(Character.toString(delimiter))).orElse(new String[0]);
+        }
+    }
+
+    private Record parseLine(String line, String[] headers, char delimiter) {
+        String[] values = line.split(Character.toString(delimiter));
+        Record record = new Record();
+        for (int i = 0; i < headers.length; i++) {
+            if (i < values.length) {
+                record.addField(headers[i], values[i]);
+            } else {
+                record.addField(headers[i], null);
+            }
+        }
+        return record;
+    }
+
+    public List<Record> getRecords() {
+        return new ArrayList<>(records);
     }
 
     public int getRecordCount() {
         return records.size();
     }
 
-    public String[] getValuesForRecord(int recordIndex) {
+    public Record getRecord(int recordIndex) {
         if (recordIndex >= 0 && recordIndex < records.size()) {
             return records.get(recordIndex);
         }
         return null;
     }
 
-    private String[] parseLine(String line) {
-        List<String> values = new ArrayList<>();
-        StringBuilder currentValue = new StringBuilder();
-        boolean insideQuotes = false;
-
-        for (char c : line.toCharArray()) {
-            if (c == '"') {
-                insideQuotes = !insideQuotes;
-            } else if (c == ',' && !insideQuotes) {
-                values.add(currentValue.toString());
-                currentValue.setLength(0);
-            } else {
-                currentValue.append(c);
-            }
+    public static void main(String[] args) {
+        CSVParser parser = new CSVParser();
+        try {
+            parser.parse("data.csv");
+            System.out.println("Total records: " + parser.getRecordCount());
+            parser.getRecords().forEach(record -> System.out.println(record.getFullName()));
+        } catch (IOException | InterruptedException | ExecutionException e) {
+            e.printStackTrace();
         }
+    }
+}
 
-        values.add(currentValue.toString());
+class Record {
+    private final ConcurrentHashMap<String, Object> fields = new ConcurrentHashMap<>();
 
-        return values.toArray(new String[0]);
+    public void addField(String fieldName, Object value) {
+        fields.put(fieldName, value);
     }
 
+    public Object getField(String fieldName) {
+        return fields.get(fieldName);
+    }
 
-}
+    public String getStringField(String fieldName) {
+        return (String) fields.get(fieldName);
+    }
